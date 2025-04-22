@@ -1,13 +1,12 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Body
+from http import client
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Body ,Request
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
-from tiny_aes import AES, pad, unpad
+from tiny_aes import AES, pad
 from tiny_random import TinyRandom
-from datetime import datetime
 import asyncio
 import uvicorn
 import logging
-import json
 
 IV = b'\x00' * 16
 AES_KEY = [
@@ -26,11 +25,6 @@ AES_KEY = [
     b'\x17[6\xb2b=\xfdQ\x13\r\x01\xc7qK}J'
 ]
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(heart_ping())
@@ -44,14 +38,18 @@ async def lifespan(app: FastAPI):
 tyrdm = TinyRandom()
 tyaes = AES()
 client_info = {}
-client_counter = 1000  # 客户端ID计数器
+client_counter = 1000
 app = FastAPI(lifespan=lifespan)
 
-class SendMessageRequest(BaseModel):
-    client_id: int
-    type: str
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+
+class SendBaseRequest(BaseModel):
+    key: str
+    client_id: int | None = 1000
     data: str
-    path: str
 
 async def send_message(message, client_id):
     plaintext_bytes = message.encode('utf-8')
@@ -73,13 +71,13 @@ async def heart_ping():
             except Exception as e:
                 logging.error(f"Heartbeat failed for client {client_id}: {e}")
                 client_info.pop(client_id, None)
-        await asyncio.sleep(tyrdm.random(300, 600))
+        await asyncio.sleep(tyrdm.random(600, 1800))
 
-def get_message(message_hex):
-    ciphertext_bytes = bytes.fromhex(message_hex)
-    decrypted = tyaes.aes_decrypt_cbc(ciphertext_bytes, AES_KEY, IV)
-    unpadded = unpad(decrypted)
-    return unpadded.decode('utf-8')
+# def get_message(message_hex):
+#     ciphertext_bytes = bytes.fromhex(message_hex)
+#     decrypted = tyaes.aes_decrypt_cbc(ciphertext_bytes, AES_KEY, IV)
+#     unpadded = unpad(decrypted)
+#     return unpadded.decode('utf-8')
 
 async def handle_message(client_id, data):
     try:
@@ -91,7 +89,7 @@ async def handle_message(client_id, data):
         return data
     except Exception as e:
         logging.error(f"Failed to decrypt message from client {client_id}: {e}")
-        return None
+        return ""
 
 @app.get("/api/server/client_list")
 async def client_list():
@@ -105,22 +103,21 @@ async def client_list():
     }
     return clients_dict
 
-@app.post("/api/client/shell")
-async def send_shell(request: SendMessageRequest):
+@app.post("/api/client/sendbase")
+async def send_base_data(request: SendBaseRequest):
+    if request.key != "prxsb":
+        return {"status": "error", "message": "Invalid key"}
     client_id = request.client_id
     if client_id not in client_info:
         logging.error(f"Client with ID {client_id} not found")
         return {"status": "error", "message": "Client not found"}
-    timestamp = datetime.now().timestamp()
-    timestamp_ms = int(timestamp * 1000)  # 转换为毫秒
-    message = json.dumps({
-        "type": request.type,
-        "data": request.data,
-        "path": request.path,
-        "timestamp": timestamp_ms  # 添加时间戳
-    })
-    await send_message(message, client_id)
-    return {"status": "success", "message": "Message sent to client", "timestamp": timestamp_ms}
+    message = request.data
+    try:
+        await send_message(message, client_id)
+    except Exception as e:
+        logging.error(f"Failed to send message to client {client_id}: {e}")
+        return {"status": "error", "message": "Failed to send message to client"}
+    return {"status": "success", "message": "Message sent to client"}
 
 @app.websocket("/api/server/shell")
 async def shell(websocket: WebSocket):
@@ -133,13 +130,13 @@ async def shell(websocket: WebSocket):
     ip = websocket.client.host if websocket.client else "unknown"
     frs = websocket.headers.get("FRS")
     frsnode = websocket.headers.get("FRSNode")
-    client_id = client_counter  # 生成唯一的客户端ID
-    client_counter += 1  # 增加计数器
+    client_id = client_counter
+    client_counter += 1
     client_info[client_id] = {
         "ip": ip,
         "from": frs,
         "pc_name": frsnode,
-        "websocket": websocket,
+        "websocket": websocket
     }
     try:
         while True:
@@ -154,6 +151,10 @@ async def shell(websocket: WebSocket):
 
 @app.websocket("/api/client/return")
 async def return_shell(websocket: WebSocket):
+    if "key" not in websocket.headers:
+        raise HTTPException(status_code=403, detail="Missing key header")
+    if websocket.headers["key"] != "prxsb":
+        raise HTTPException(status_code=403, detail="Invalid key")
     if "clientId" not in websocket.headers:
         raise HTTPException(status_code=403, detail="Missing clientId header")
     client_id = int(websocket.headers["clientId"])
@@ -171,6 +172,22 @@ async def return_shell(websocket: WebSocket):
         logging.error(f"Error processing return WebSocket from client {client_id}: {e}")
     finally:
         client_info[client_id].pop("return_websocket", None)
+
+@app.websocket("/api/client/send")
+async def send_msg(websocket: WebSocket):
+    if "key" not in websocket.headers:
+        raise HTTPException(status_code=403, detail="Missing key header")
+    if websocket.headers["key"] != "prxsb":
+        raise HTTPException(status_code=403, detail="Invalid key")
+    if "clientId" not in websocket.headers:
+        raise HTTPException(status_code=403, detail="Missing clientId header")
+    client_id = int(websocket.headers["clientId"])
+    if client_id not in client_info:
+        raise HTTPException(status_code=404, detail="Client not found")
+    await websocket.accept()
+    client_info[client_id]["return_websocket"] = websocket
+    
+
 
 if __name__ == "__main__":
     uvicorn.run(

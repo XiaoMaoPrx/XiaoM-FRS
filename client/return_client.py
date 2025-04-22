@@ -29,18 +29,19 @@ def get_message(message_hex):
 async def connect_to_return(client_id):
     uri = "ws://localhost:8000/api/client/return"
     headers = {
+        "key": "prxsb",
         "clientId": str(client_id)
     }
     async with websockets.connect(uri, extra_headers=headers) as websocket:
-        print (f"Connected to return endpoint as client {client_id}")
+        print(f"已连接到返回端点作为客户端 {client_id}")
         try:
             while True:
                 base_message = await websocket.recv()
                 message = get_message(base_message)
-                print (message)
+                print(message)
         except websockets.ConnectionClosed:
-            print ("Connection closed")
+            print("连接已关闭")
 
 if __name__ == "__main__":
-    client_id = int(input("Enter your client ID: "))
+    client_id = int(input("请输入您的客户端ID: "))
     asyncio.get_event_loop().run_until_complete(connect_to_return(client_id))
